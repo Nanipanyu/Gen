@@ -1,0 +1,24 @@
+# PyTorch ecosystem for Signal DiT training
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Scientific computing
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Signal processing and seismology
+obspy>=1.4.0
+
+# Data handling and visualization
+matplotlib>=3.5.0
+h5py>=3.7.0
+
+# Progress tracking
+tqdm>=4.64.0
+
+# Logging and monitoring
+tensorboard>=2.10.0
+
+# Optional: For faster training on CPU
+# mkl>=2023.0  # Intel Math Kernel Library for AMD/Intel CPUs
