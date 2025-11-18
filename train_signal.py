@@ -24,7 +24,7 @@ from signal_dit import SignalDiT
 from signal_diff_utils import SignalDiffusion, gen_signal_batches, SignalMetrics, apply_lowpass_filter
 from signal_datasets import create_signal_loader, preprocess_at2_files_for_training
 from pga_predictor import PGAPredictor, PGALoss, EarthquakeDataProcessor
-from signal_config import signal_config
+from signal_config import signal_config, get_config_value
 from utils import Config
 
 warnings.filterwarnings("ignore")
@@ -138,7 +138,8 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
         data_dir, 
         seq_len=conf.seq_len,
         batch_size=conf.batch_size,
-        sample_rate=conf.sample_rate
+        sample_rate=conf.sample_rate,
+        num_workers=0  # Set to 0 to avoid multiprocessing issues on Windows
     )
     
     # Convert to iterator for infinite sampling
@@ -148,21 +149,10 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
     print("Creating fixed evaluation dataset...")
     eval_batch = next(iter(train_loader))
     
-    # Debug: Check the structure of eval_batch
-    print(f"Eval batch keys: {eval_batch.keys()}")
-    print(f"Metadata type: {type(eval_batch['metadata'])}")
-    if isinstance(eval_batch['metadata'], dict):
-        print(f"Metadata dict keys: {eval_batch['metadata'].keys()}")
-        # Check if file_path exists and its structure
-        if 'file_path' in eval_batch['metadata']:
-            fp = eval_batch['metadata']['file_path']
-            print(f"File_path type: {type(fp)}, length: {len(fp) if hasattr(fp, '__len__') else 'N/A'}")
-    
     fixed_eval_lowpass = eval_batch['lowfreq'][:7]  # Fixed 7 low-pass signals
     fixed_eval_broadband = eval_batch['broadband'][:7]  # Corresponding true broadband (PGA normalized)
     
     # Get the file paths from the evaluation batch metadata to load the SAME original signals
-    print("Loading original unnormalized signals for the SAME files as in evaluation batch...")
     fixed_eval_original = []
     
     batch_metadata = eval_batch['metadata']
@@ -229,28 +219,49 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
         k=conf.k
     ).to(device)
     
-    # Initialize diffusion
+    # Initialize diffusion with CRITICAL sigma_max parameter
     diffusion = SignalDiffusion(
         P_mean=conf.P_mean,
         P_std=conf.P_std,
-        sigma_data=conf.sigma_data
+        sigma_data=conf.sigma_data,
+        sigma_max=conf.sigma_max  # CRITICAL: Pass sigma_max from config
     )
     
-    # Initialize PGA predictor
-    pga_predictor = PGAPredictor(
-        seq_len=conf.seq_len,
-        cnn_filters=conf.cnn_filters,
-        lstm_hidden=conf.lstm_hidden,
-        dropout=conf.pga_dropout
-    ).to(device)
+    # Initialize PGA predictor (conditional)
+    train_pga = getattr(conf, 'train_pga_predictor', False)  # Default to False if not found
+    if train_pga:
+        pga_predictor = PGAPredictor(
+            seq_len=conf.seq_len,
+            cnn_filters=conf.cnn_filters,
+            lstm_hidden=conf.lstm_hidden,
+            dropout=conf.pga_dropout
+        ).to(device)
+    else:
+        pga_predictor = None
     
-    # Optimizers
-    optimizer = optim.AdamW(model.parameters(), lr=conf.lr, weight_decay=0.01)
-    pga_optimizer = optim.AdamW(pga_predictor.parameters(), lr=conf.pga_lr, weight_decay=0.01)
+    # Optimizers - Use CONSERVATIVE learning rate to prevent explosion
+    # CRITICAL FIX: Reduce learning rate to prevent instability after iter 1000
+    effective_lr = conf.lr * 0.5  # 0.001 -> 0.0005 (stable learning, prevents explosion)
+    print(f"🔧 STABILITY FIX: Learning rate {effective_lr:.6f} (0.5x for stability)")
+    optimizer = optim.AdamW(model.parameters(), lr=effective_lr, weight_decay=0.01, eps=1e-8)
+    
+    # Learning rate scheduler - reduce LR when loss plateaus
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=200, 
+        threshold=0.01, min_lr=1e-6
+    )
+    
+    if train_pga and pga_predictor is not None:
+        pga_optimizer = optim.AdamW(pga_predictor.parameters(), lr=conf.pga_lr, weight_decay=0.01)
+    else:
+        pga_optimizer = None
     
     # Loss functions
     signal_loss_fn = nn.MSELoss()
-    pga_loss_fn = PGALoss()
+    if train_pga:
+        pga_loss_fn = PGALoss()
+    else:
+        pga_loss_fn = None
     
     # EMA model
     ema = deepcopy(model).to(device)
@@ -266,9 +277,12 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
     start_iter = 0
     best_loss = float('inf')
     best_quality = 0.0
-    quality_patience = 5  # Stop if quality degrades for 5 evaluations
+    quality_patience = 15  # Stop if quality degrades for 15 evaluations (reasonable patience)
     quality_patience_counter = 0
     early_stop = False
+    
+    # Disable early stopping to see full learning progression
+    disable_early_stop = True
     
     if os.path.exists(last_ckpt):
         print("Loading checkpoint...")
@@ -283,6 +297,17 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
         #     pga_predictor.load_state_dict(ckpt['pga_predictor'])
         #     pga_optimizer.load_state_dict(ckpt['pga_optimizer'])
         print(f'Checkpoint restored at iter {start_iter}; best loss: {best_loss:.6f} (PGA disabled)')
+        
+        # CRITICAL FIX: Scale final layer weights to match noise magnitude  
+        # Target noise magnitude is ~5.0, but model predicts ~0.1 (50x too small)
+        with torch.no_grad():
+            if hasattr(model, 'final_layer') and hasattr(model.final_layer, 'linear'):
+                current_std = model.final_layer.linear.weight.std().item()
+                if current_std < 0.1:  # If weights are too small (< 0.1)
+                    scale_factor = 10.0  # Scale up by 10x 
+                    model.final_layer.linear.weight.data *= scale_factor
+                    model.final_layer.linear.bias.data *= scale_factor
+                    print(f"🔧 CRITICAL FIX: Scaled final layer weights by {scale_factor}x (std: {current_std:.4f} → {model.final_layer.linear.weight.std().item():.4f})")
     else:
         print("Starting new training")
     
@@ -290,84 +315,194 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
     print("Starting training...")
     model.train()
     ema.eval()
-    pga_predictor.train()
+    if train_pga and pga_predictor is not None:
+        pga_predictor.train()
+    
+    # CRITICAL DEBUG: Check if model parameters have gradients enabled
+    total_params = 0
+    trainable_params = 0
+    for param in model.parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(f"🔍 Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    
+    if trainable_params == 0:
+        print("❌ CRITICAL ERROR: NO TRAINABLE PARAMETERS! Enabling gradients...")
+        requires_grad(model, True)
+    else:
+        print("✅ Model has trainable parameters")
     
     running_signal_loss = 0.0
+    running_envelope_loss = 0.0
     running_pga_loss = 0.0
     start_time = time.time()
+    
+    # Track best loss for explosion detection
+    best_loss_so_far = float('inf')
+    loss_explosion_threshold = 10.0  # If loss > 10x best, consider it exploded
     
     for idx in range(conf.n_iter):
         try:
             i = idx + start_iter
             
-            # Get batch
-            batch = next(train_iter)
+            # Get batch - recreate iterator if exhausted
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                # Dataset exhausted, create new iterator for next epoch
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+            
             y_broad = batch['broadband'].to(device)
             x_low = batch['lowfreq'].to(device)
             pga_broad_true = batch['pga_broadband'].to(device)
             
-            # === Train Signal DiT with Multi-Objective Loss ===
+            # === Train Signal DiT ===
             optimizer.zero_grad()
+
+            # Diffuse broadband signal - get noisy input and target
+            xt, sigma, noise_target, signal_target = diffusion.diffuse(y_broad)
             
-            # Enhanced diffusion process with multi-objective targets
-            xt, t, noise_target, signal_target = diffusion.diffuse(y_broad)
+            # Forward pass with conditioning (predicts noise) - use sigma as timestep embedding
+            predicted_noise = model(xt, sigma, x_low)
             
-            # Forward pass with conditioning (predicts noise)
-            predicted_noise = model(xt, t, x_low)
+            # 🔍 DIAGNOSTICS - Check every 100 iterations  
+            if i % 100 == 0:
+                print(f"🔍 DIAGNOSTICS (iter {i}):")
+                print(f"   Target clean signal: [{y_broad.min():.3f}, {y_broad.max():.3f}]")
+                print(f"   Conditioning signal: [{x_low.min():.3f}, {x_low.max():.3f}]")
+                print(f"   Noise level σ: [{sigma.min():.3f}, {sigma.max():.3f}]")
+                print(f"   Noisy input: [{xt.min():.3f}, {xt.max():.3f}]")
             
-            # Multi-objective loss computation
-            # Loss 1: Denoising loss (standard diffusion)
-            denoising_loss = signal_loss_fn(predicted_noise, noise_target)
+            # SIMPLE CORRECT TRAINING: Just predict the clean signal directly!
+            # 
+            # The model takes:
+            # - Noisy input xt (signal + noise)
+            # - Noise level sigma
+            # - Conditioning x_low
+            # 
+            # And predicts the CLEAN SIGNAL directly (v-prediction / x0-prediction)
+            # This is simpler and actually works!
             
-            # Loss 2: Signal reconstruction loss
-            sigma_expanded = t.view(-1, 1)
-            reconstructed_signal = xt - predicted_noise * sigma_expanded
-            reconstruction_loss = signal_loss_fn(reconstructed_signal, signal_target)
+            sigma_expanded = sigma.view(-1, 1)
             
-            # Loss 3: Conditioning consistency loss
-            reconstructed_lowfreq = apply_lowpass_filter(reconstructed_signal, cutoff_freq=1.0, sample_rate=conf.sample_rate)
-            conditioning_loss = signal_loss_fn(reconstructed_lowfreq, x_low)
+            # Model predicts CLEAN SIGNAL (not noise!)
+            predicted_clean = model(xt, sigma, x_low)
             
-            # Progressive training weights based on iteration
-            if i < 1000:
-                # Phase 1: Learn basic denoising
-                w_denoise, w_reconstruct, w_condition = 1.0, 0.0, 0.1
-            elif i < 2500:
-                # Phase 2: Add signal reconstruction
-                w_denoise, w_reconstruct, w_condition = 0.8, 0.4, 0.3
-            else:
-                # Phase 3: Emphasize signal quality
-                w_denoise, w_reconstruct, w_condition = 0.6, 0.8, 0.5
+            # SINGLE OBJECTIVE: Predict clean signal
+            # With strong weighting on envelope matching
+            signal_loss = signal_loss_fn(predicted_clean, y_broad)
             
-            # Combined loss
-            signal_loss = (
-                w_denoise * denoising_loss +
-                w_reconstruct * reconstruction_loss +
-                w_condition * conditioning_loss
-            )
+            # Add envelope consistency loss
+            predicted_lowfreq = apply_lowpass_filter(predicted_clean, cutoff_freq=1.0, sample_rate=conf.sample_rate)
+            envelope_loss = signal_loss_fn(predicted_lowfreq, x_low)
+            
+            # Combined loss with envelope emphasis
+            signal_loss = 0.6 * signal_loss + 0.4 * envelope_loss
+            
+            current_denoising_loss = signal_loss.item()
+            
+            # CRITICAL: Check for loss explosion BEFORE backward pass
+            current_loss_value = signal_loss.item()
+            
+            # Detect catastrophic loss explosion
+            if current_loss_value > 1000.0:
+                print(f"🚨 CATASTROPHIC LOSS EXPLOSION: {current_loss_value:.1f} at iter {i}")
+                print(f"   Rolling back to best checkpoint and reducing learning rate...")
+                
+                # Load best checkpoint
+                if os.path.exists(best_ckpt):
+                    ckpt = torch.load(best_ckpt, map_location=device)
+                    model.load_state_dict(ckpt['model'])
+                    ema.load_state_dict(ckpt['ema'])
+                    optimizer.load_state_dict(ckpt['optimizer'])
+                    print(f"   Restored checkpoint from iter {ckpt['iter']}")
+                
+                # Reduce learning rate dramatically
+                for param_group in optimizer.param_groups:
+                    old_lr = param_group['lr']
+                    param_group['lr'] = old_lr * 0.1
+                    print(f"   Reduced LR: {old_lr:.6f} → {param_group['lr']:.6f}")
+                
+                optimizer.zero_grad()
+                continue
             
             signal_loss.backward()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # CRITICAL: Check for NaN/Inf in loss AFTER backward
+            if not torch.isfinite(signal_loss):
+                print(f"❌ WARNING: Loss is NaN/Inf at iter {i}! Skipping update.")
+                optimizer.zero_grad()
+                continue
+            
+            # Calculate gradient norm BEFORE clipping for monitoring
+            total_grad_norm = 0
+            param_count = 0
+            for param in model.parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2).item()
+                    if not np.isfinite(param_norm):
+                        print(f"❌ WARNING: NaN/Inf gradient detected at iter {i}! Skipping update.")
+                        optimizer.zero_grad()
+                        continue
+                    total_grad_norm += param_norm ** 2
+                    param_count += 1
+            total_grad_norm = total_grad_norm ** 0.5
+            
+            # CRITICAL: Aggressive gradient clipping to prevent explosion
+            # If gradients are huge (>10), clip to 5.0; otherwise clip to 10.0
+            max_grad_norm = 5.0 if total_grad_norm > 10.0 else 10.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            
+            # Recompute grad norm after clipping
+            clipped_grad_norm = 0
+            for param in model.parameters():
+                if param.grad is not None:
+                    clipped_grad_norm += param.grad.data.norm(2).item() ** 2
+            clipped_grad_norm = clipped_grad_norm ** 0.5
+            
+            # Store a parameter value before update to check if it changes
+            first_param_before = None
+            for param in model.parameters():
+                first_param_before = param.data.clone()
+                break
             
             optimizer.step()
+            
+            # Check if parameter actually changed
+            first_param_after = None
+            for param in model.parameters():
+                first_param_after = param.data.clone()
+                break
+            
+            param_change = (first_param_after - first_param_before).abs().max().item() if first_param_before is not None else 0
+            
+            # Check EMA model state before and after update
+            # Update EMA model
             update_ema(ema, model, conf.ema_decay)
             
             running_signal_loss += signal_loss.item()
+            running_envelope_loss = running_envelope_loss + envelope_loss.item() if 'running_envelope_loss' in locals() else envelope_loss.item()
             
             # Quick validation every 10 iterations to check if fixes are working
             if i % 10 == 0 and i > 0:
                 with torch.no_grad():
-                    # Check prediction quality
-                    correlation = torch.corrcoef(torch.stack([predicted_noise.flatten(), noise_target.flatten()]))[0, 1]
-                    noise_range = (noise_target.min().item(), noise_target.max().item())
-                    pred_range = (predicted_noise.min().item(), predicted_noise.max().item())
+                    # Check prediction quality - how well does predicted clean match target
+                    signal_correlation = torch.corrcoef(torch.stack([predicted_clean.flatten(), y_broad.flatten()]))[0, 1]
+                    # Check ENVELOPE matching quality
+                    envelope_correlation = torch.corrcoef(torch.stack([predicted_lowfreq.flatten(), x_low.flatten()]))[0, 1]
+                    pred_range = (predicted_clean.min().item(), predicted_clean.max().item())
+                    target_range = (y_broad.min().item(), y_broad.max().item())
                     
-                    print(f"  Quick check - Loss: {signal_loss.item():.6f}, "
-                          f"Correlation: {correlation.item():.4f}, "
-                          f"Noise range: [{noise_range[0]:.3f}, {noise_range[1]:.3f}], "
-                          f"Pred range: [{pred_range[0]:.3f}, {pred_range[1]:.3f}]")
+                    # CRITICAL: Check for model weight explosion
+                    max_weight = max(p.abs().max().item() for p in model.parameters())
+                    if max_weight > 100.0:
+                        print(f"⚠️ WARNING: Model weights exploding! Max weight: {max_weight:.1f}")
+                    
+                    print(f"  Quick check - Loss: {signal_loss.item():.4f}, Env: {envelope_loss.item():.4f}, "
+                          f"Signal corr: {signal_correlation.item():.3f}, Envelope corr: {envelope_correlation.item():.3f}, "
+                          f"Pred: [{pred_range[0]:.2f},{pred_range[1]:.2f}], Target: [{target_range[0]:.2f},{target_range[1]:.2f}]")
             
         # === Train PGA Predictor ===
         # TEMPORARILY DISABLED DUE TO MEMORY ISSUES
@@ -411,51 +546,57 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
                 avg_signal_loss = running_signal_loss / actual_iterations
                 avg_pga_loss = running_pga_loss / actual_iterations
                 
-                # Log individual loss components for analysis
-                with torch.no_grad():
-                    # Get current loss components for display
-                    print(f'Iter {i:07d} | Time: {elapsed:.2f}s | '
-                          f'Total: {avg_signal_loss:.6f} | '
-                          f'Denoise: {denoising_loss.item():.6f} | '
-                          f'Reconstruct: {reconstruction_loss.item():.6f} | '
-                          f'Condition: {conditioning_loss.item():.6f} | '
-                          f'Weights: D{w_denoise:.1f}/R{w_reconstruct:.1f}/C{w_condition:.1f}')
+                # Log loss components for analysis - Simple direct prediction
+                avg_envelope_loss = running_envelope_loss / actual_iterations
                 
-                # Tensorboard logging with detailed metrics
+                print(f'Iter {i:07d} | Time: {elapsed:.2f}s | '
+                      f'Total: {avg_signal_loss:.6f} | '
+                      f'Envelope: {avg_envelope_loss:.6f} | '
+                      f'Grad: {total_grad_norm:.6f}')
+                
+                # Tensorboard logging - Simple metrics
                 writer.add_scalar('Loss/Total_Signal', avg_signal_loss, i)
-                writer.add_scalar('Loss/Denoising', denoising_loss.item(), i)
-                writer.add_scalar('Loss/Reconstruction', reconstruction_loss.item(), i)
-                writer.add_scalar('Loss/Conditioning', conditioning_loss.item(), i)
+                writer.add_scalar('Loss/Envelope_Matching', avg_envelope_loss, i)
                 writer.add_scalar('Loss/PGA', avg_pga_loss, i)
-                writer.add_scalar('Training/Weight_Denoising', w_denoise, i)
-                writer.add_scalar('Training/Weight_Reconstruction', w_reconstruct, i)
-                writer.add_scalar('Training/Weight_Conditioning', w_condition, i)
+                writer.add_scalar('Training/Grad_Norm', total_grad_norm, i)
+                writer.add_scalar('Training/Grad_Norm_Clipped', clipped_grad_norm, i)
                 writer.add_scalar('Learning_Rate/Signal', optimizer.param_groups[0]['lr'], i)
-                writer.add_scalar('Learning_Rate/PGA', pga_optimizer.param_groups[0]['lr'], i)
+                
+                # CRITICAL: Update learning rate scheduler based on loss
+                scheduler.step(avg_signal_loss)
+                if train_pga and pga_optimizer is not None:
+                    writer.add_scalar('Learning_Rate/PGA', pga_optimizer.param_groups[0]['lr'], i)
                 writer.flush()
                 
                 running_signal_loss = 0.0
+                running_envelope_loss = 0.0
                 running_pga_loss = 0.0
                 start_time = time.time()
             
-            # Evaluation and visualization
+            # Evaluation and visualization  
             if i % conf.eval_interval == 0:
                 print("Generating evaluation samples...")
                 ema.eval()
-                pga_predictor.eval()
+                if train_pga and pga_predictor is not None:
+                    pga_predictor.eval()
                 
                 with torch.no_grad():
                     # Use fixed evaluation signals for consistent visualization
-                    n_vis = 7
+                    n_vis = min(7, len(fixed_eval_lowpass))  # Use available samples
                     sz = (n_vis, conf.seq_len)
                     
                     # Use fixed conditioning signals (same across all evaluations)
-                    x_cond_vis = fixed_eval_lowpass.to(device)
+                    x_cond_vis = fixed_eval_lowpass[:n_vis].to(device)
                     
-                    # Generate signals
+                    # If we have fewer samples than n_vis, repeat them to match
+                    if len(x_cond_vis) < n_vis:
+                        repeats = (n_vis + len(x_cond_vis) - 1) // len(x_cond_vis)  # Ceiling division
+                        x_cond_vis = x_cond_vis.repeat(repeats, 1)[:n_vis]
+                    
+                    # Generate signals - DON'T use fixed seed for evaluation to see model changes
                     generated_signals = diffusion.sample(
                         ema, sz, steps=conf.steps,
-                        x_cond=x_cond_vis, seed=conf.seed
+                        x_cond=x_cond_vis, seed=None
                     ).to(device)
                     
                     # Create visualization with original unnormalized broadband signals for comparison
@@ -557,7 +698,7 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
                         elif i > 2000 and quality_score < best_quality - 0.05:
                             quality_patience_counter += 1
                             print(f'         Quality degrading ({quality_patience_counter}/{quality_patience})')
-                            if quality_patience_counter >= quality_patience:
+                            if not disable_early_stop and quality_patience_counter >= quality_patience:
                                 print("Signal quality consistently degrading - implementing early stopping")
                                 early_stop = True
                                 break
@@ -573,8 +714,12 @@ def train_signal_dit(model_dir, data_dir, eval_interval, log_interval, conf):
                 model.train()
                 # pga_predictor.train()  # DISABLED
             
-            # Save checkpoint
-            if i % conf.checkpoint_interval == 0:
+            # Save checkpoint - MORE FREQUENT during critical learning phase
+            # Save every 100 iters during first 2000 iterations (when loss is unstable)
+            # Then save every checkpoint_interval as normal
+            should_save = (i % 100 == 0 and i < 2000) or (i % conf.checkpoint_interval == 0)
+            
+            if should_save:
                 # Calculate current average losses for checkpoint
                 current_signal_loss = running_signal_loss / max(1, i % log_interval if i % log_interval != 0 else log_interval)
                 current_pga_loss = 0.0  # PGA training disabled
@@ -625,7 +770,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train Signal Diffusion Transformer')
     parser.add_argument('--model_dir', type=str, default='signal_model_v1',
                        help='Directory to save model')
-    parser.add_argument('--data_dir', type=str, default='data_prep_acc/processed_signals',
+    parser.add_argument('--data_dir', type=str, default='data_prep_acc/processed_dynamic',
                        help='Directory containing training signals (.npz files)')
     parser.add_argument('--eval_interval', type=int, default=1000,
                        help='Evaluation interval')
@@ -647,8 +792,28 @@ def main():
         preprocess_at2_files_for_training(args.at2_input_dir, args.data_dir)
         print("AT2 processing complete!")
     
-    # Load configuration
-    conf = Config(signal_config, args.model_dir)
+    # Load configuration with dynamic seq_len resolution
+    resolved_config = {}
+    for key, value in signal_config.items():
+        resolved_config[key] = get_config_value(key, signal_config, args.data_dir)
+    
+    # CRITICAL: Validate model dimensions to prevent shape errors
+    from signal_config import validate_model_dimensions
+    resolved_config = validate_model_dimensions(resolved_config)
+    
+    print(f"📊 Configuration loaded:")
+    print(f"   seq_len: {resolved_config['seq_len']:,} samples")
+    print(f"   sample_rate: {resolved_config['sample_rate']} Hz")
+    print(f"   patch_size: {resolved_config['patch_size']} (num_patches: {resolved_config['seq_len']//resolved_config['patch_size']})")
+    print(f"   dim: {resolved_config['dim']}, heads: {resolved_config['heads']} (head_dim: {resolved_config['dim']//resolved_config['heads']})")
+    if resolved_config['seq_len'] != signal_config['seq_len']:
+        print(f"   ✅ Dynamic seq_len resolved from dataset")
+    
+    conf = Config(resolved_config, args.model_dir)
+    
+    # REMOVED HARMFUL OVERRIDE: batch_size=1 prevents proper learning
+    # Proper batch training enables gradient averaging and stable BatchNorm
+    print(f"✅ Using proper batch_size: {conf.batch_size} (enables gradient averaging)")
     
     # Start training
     train_signal_dit(

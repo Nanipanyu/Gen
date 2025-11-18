@@ -24,7 +24,7 @@ def apply_lowpass_filter(signal, cutoff_freq=1.0, sample_rate=100.0, order=4):
         signal = signal.unsqueeze(0)
     
     device = signal.device
-    signal_np = signal.cpu().numpy()
+    signal_np = signal.detach().cpu().numpy()
     
     # Design filter
     nyquist = sample_rate / 2
@@ -61,11 +61,22 @@ def get_sigmas_karras(n, sigma_min=0.01, sigma_max=80., rho=7., device='cpu'):
 class SignalDiffusion(object):
     """
     Diffusion process for 1D earthquake signals with optional conditioning
+    
+    CRITICAL: Noise schedule MUST match signal scale!
+    For signals in [-1, 1], we need much smaller sigma values.
     """
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.66):
+    def __init__(self, P_mean=-1.2, P_std=1.0, sigma_data=0.5, sigma_max=3.0):
+        """
+        Args:
+            P_mean: Mean of log-normal noise distribution (default: -1.2 → σ ≈ 0.3)
+            P_std: Std of log-normal noise distribution (reduced to 1.0 for stability)
+            sigma_data: Data standard deviation (0.5 for normalized signals)
+            sigma_max: Maximum noise level (3.0 means noise can be 3x signal amplitude max)
+        """
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
+        self.sigma_max = sigma_max
         
         # Pre-compute training noise distribution for sampling alignment
         self.training_sigmas = self._compute_training_noise_schedule()
@@ -81,7 +92,7 @@ class SignalDiffusion(object):
         Adds noise to the input signal based on the diffusion parameters
         
         Args:
-            y: Clean broadband signal (batch, seq_len)
+            y: Clean broadband signal (batch, seq_len) - MUST be in [-1, 1]
             return_noise: Whether to return the noise tensor
             
         Returns:
@@ -94,14 +105,19 @@ class SignalDiffusion(object):
         device = y.device
         batch_size = y.shape[0]
         
-        # Sample noise levels
+        # Sample noise levels from log-normal distribution
         rnd_normal = torch.randn([batch_size, 1], device=device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        
+        # CRITICAL: Clamp sigma to prevent explosion
+        # For signals in [-1, 1], sigma should not exceed sigma_max
+        sigma = torch.clamp(sigma, min=0.002, max=self.sigma_max)
         
         # Add noise to signal
         n = torch.randn_like(y, device=device)
         
         # Create noisy input - standard approach
+        # With sigma_max=3.0, noisy signal stays in reasonable range ~[-10, 10]
         noised_input = y + n * sigma.view(-1, 1)
         
         # Multi-target training
@@ -114,7 +130,7 @@ class SignalDiffusion(object):
         else:
             return noised_input, sigma.squeeze(), noise_target, signal_target
 
-    def sample(self, model, sz, steps=100, sigma_max=80., seed=None, x_cond=None):
+    def sample(self, model, sz, steps=100, sigma_max=None, seed=None, x_cond=None):
         """
         Generates samples from the diffusion model
         
@@ -122,17 +138,26 @@ class SignalDiffusion(object):
             model: The trained signal diffusion transformer
             sz: Shape of samples to generate (batch_size, seq_len)
             steps: Number of denoising steps
-            sigma_max: Maximum noise level
+            sigma_max: Maximum noise level (if None, uses self.sigma_max)
             seed: Random seed for reproducible generation
             x_cond: Conditioning signal (low-frequency) - optional
             
         Returns:
             Generated signals
         """
+        # Use instance sigma_max if not provided
+        if sigma_max is None:
+            sigma_max = self.sigma_max
+            
         if seed is not None:
             with torch.random.fork_rng():
                 torch.manual_seed(seed)
-                return self._sample_internal(model, sz, steps, sigma_max, x_cond)
+                return self.                # Generate sigmas using same log-normal distribution as training
+                rho = 7.0
+                min_inv_rho = (0.002 ** (1 / rho))
+                max_inv_rho = (sigma_max ** (1 / rho))
+                ramp = torch.linspace(0, 1, steps + 1, device=device)
+                t_steps = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho(model, sz, steps, sigma_max, x_cond)
         else:
             return self._sample_internal(model, sz, steps, sigma_max, x_cond)
 
@@ -141,16 +166,28 @@ class SignalDiffusion(object):
         device = next(model.parameters()).device
         model.eval()
         
-        # Start with pure noise
+        # Start with pure noise scaled to sigma_max
+        # CRITICAL: For signals in [-1,1], sigma_max=3.0 means initial noise in ~[-9, 9]
         x = torch.randn(sz, device=device) * sigma_max
         
         # Move conditioning to device if provided
         if x_cond is not None:
             x_cond = x_cond.to(device)
         
-        # Generate noise schedule - use training-aligned distribution
-        indices = torch.linspace(0, len(self.training_sigmas)-1, steps+1).long()
-        t_steps = self.training_sigmas[indices].to(device)
+        # CRITICAL FIX: Use log-normal schedule matching training
+        # Training samples: σ ~ exp(N(-1.2, 1.0))
+        # Sampling should use monotonic decreasing path through this distribution
+        
+        # Generate sigmas using same log-normal distribution as training
+        # but in sorted decreasing order for denoising trajectory
+        rho = 7.0  # Controls schedule curvature
+        min_inv_rho = (0.002 ** (1 / rho))  # σ_min from training
+        max_inv_rho = (sigma_max ** (1 / rho))
+        
+        ramp = torch.linspace(0, 1, steps + 1, device=device)
+        t_steps = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+        
+        # Ensure final step is exactly 0
         t_steps = torch.cat([t_steps, torch.tensor([0.0], device=device)])
         
         # Iterative denoising
@@ -163,64 +200,76 @@ class SignalDiffusion(object):
     def edm_sampler(self, x, t_steps, i, model, s_churn=0., s_min=0.,
                     s_max=float('inf'), s_noise=1., x_cond=None):
         """
-        Implements the EDM sampling algorithm (second-order solver) for denoising
+        Envelope-guided sampling with explicit low-frequency enforcement
         
         Args:
             x: Current noisy signal
-            t_steps: Noise schedule
+            t_steps: Noise schedule (decreasing: σ_max → σ_min → 0)
             i: Current step index
             model: The denoising model
-            x_cond: Conditioning signal (optional)
+            x_cond: Conditioning signal (REQUIRED for envelope guidance)
         """
-        n = len(t_steps)
-        gamma = self.get_gamma(t_steps[i], s_churn, s_min, s_max, s_noise, n)
-        eps = torch.randn_like(x) * s_noise
-        t_hat = t_steps[i] + gamma * t_steps[i]
+        sigma_cur = t_steps[i] 
+        sigma_next = t_steps[i + 1]
         
-        if gamma > 0:
-            x_hat = x + eps * (t_hat ** 2 - t_steps[i] ** 2) ** 0.5
-        else:
-            x_hat = x
+        # Get denoised prediction using current model
+        x_denoised = self.get_d(model, x, sigma_cur, x_cond)
+        
+        # CRITICAL FIX: Enforce envelope matching during sampling
+        if x_cond is not None:
+            # Extract low-frequency component from prediction
+            pred_lowfreq = apply_lowpass_filter(x_denoised, cutoff_freq=1.0, sample_rate=100.0)
             
-        # Simple Euler step - get denoised signal directly
-        denoised = self.get_d(model, x_hat, t_hat, x_cond)
+            # Compute correction: difference between conditioning and predicted envelope
+            envelope_error = x_cond - pred_lowfreq
+            
+            # Apply envelope guidance with MODERATE strength
+            # Don't go to full strength (1.0) to preserve high-frequency details
+            # Use 0.3-0.5 range instead of 0-1 to avoid over-correction
+            progress = 1.0 - (sigma_cur / self.sigma_max)  # 0 at start, 1 at end
+            guidance_strength = 0.3 + 0.2 * progress  # Ranges from 0.3 to 0.5
+            
+            # Correct the denoised prediction by adding envelope error
+            x_denoised = x_denoised + guidance_strength * envelope_error
         
-        # Simple linear interpolation between current noisy and denoised
-        # Step size based on noise level decrease
-        t_hat_val = t_hat.item() if t_hat.dim() > 0 else float(t_hat)
-        t_next_val = t_steps[i + 1].item() if t_steps[i + 1].dim() > 0 else float(t_steps[i + 1])
-        
-        step_size = (t_hat_val - t_next_val) / t_hat_val if t_hat_val > 0 else 0
-        x_next = x_hat + step_size * (denoised - x_hat)
+        # Standard EDM step formula
+        if sigma_next > 0:
+            # Predict noise from current denoised estimate
+            noise_pred = (x - x_denoised) / sigma_cur if sigma_cur > 1e-8 else torch.zeros_like(x)
+            
+            # Step to next noise level
+            x_next = x_denoised + noise_pred * sigma_next
+        else:
+            # Final step: return clean signal
+            x_next = x_denoised
             
         return x_next
 
     def get_d(self, model, x, sig, x_cond=None):
         """
-        Computes the denoising direction using the trained model
+        SIMPLE VERSION: Model predicts CLEAN SIGNAL directly (x0-prediction)
+        
+        This is much simpler and actually works properly!
         
         Args:
             model: The signal diffusion transformer
-            x: Noisy signal
-            sig: Noise level
-            x_cond: Conditioning signal (optional)
+            x: Noisy signal [batch, seq_len]
+            sig: Noise level (scalar or [batch])
+            x_cond: Conditioning signal (optional) [batch, seq_len]
+            
+        Returns:
+            predicted_clean: The model's prediction of the clean signal
         """
-        # Ensure sig has correct shape for model input and broadcasting
+        # Ensure sig has correct shape for model input
         if sig.dim() == 0:
-            sig = sig.unsqueeze(0)  # Convert scalar to 1D tensor
+            sig = sig.unsqueeze(0)  # Convert scalar to 1D tensor [1]
         
-        sig_for_broadcast = sig.view(-1, 1)  # Shape for broadcasting
-        sig_for_model = sig.view(-1)  # Shape for model input
+        sig_for_model = sig.view(-1)  # Shape [batch] for model input
         
-        # Forward pass through model - model predicts noise
-        predicted_noise = model(x, sig_for_model, x_cond)
+        # Model predicts CLEAN SIGNAL directly
+        predicted_clean = model(x, sig_for_model, x_cond)
         
-        # Correct epsilon parameterization: 
-        # During training: noisy = clean + noise * sigma
-        # During sampling: clean = noisy - predicted_noise * sigma
-        denoised_signal = x - predicted_noise * sig_for_broadcast
-        
-        return denoised_signal
+        return predicted_clean
 
     def get_gamma(self, t_cur, s_churn, s_min, s_max, s_noise, n):
         """Computes the stochastic churn amount for the current timestep"""

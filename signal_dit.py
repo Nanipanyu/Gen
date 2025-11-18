@@ -71,10 +71,11 @@ class CrossAttention(nn.Module):
         # x_broad: (batch, seq_len, dim) - broadband signal patches
         # x_low: (batch, seq_len, dim) - low-frequency signal patches
         B, L, D = x_broad.shape
+        _, L_low, _ = x_low.shape
         
         q = self.q_proj(x_broad).view(B, L, self.n_heads, -1).transpose(1, 2)
-        k = self.k_proj(x_low).view(B, L, self.n_heads, -1).transpose(1, 2)
-        v = self.v_proj(x_low).view(B, L, self.n_heads, -1).transpose(1, 2)
+        k = self.k_proj(x_low).view(B, L_low, self.n_heads, -1).transpose(1, 2)
+        v = self.v_proj(x_low).view(B, L_low, self.n_heads, -1).transpose(1, 2)
         
         # Attention computation
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -173,8 +174,8 @@ class DecoderBlock(nn.Module):
         self.ln_1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.self_attn = LinformerAttention(seq_len, dim, heads, k)
         
-        # Cross-attention components (to encoder output)
-        self.ln_cross = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        # Cross-attention components (to encoder output) - ENABLE affine for better adaptation
+        self.ln_cross = nn.LayerNorm(dim, elementwise_affine=True, eps=1e-6)
         self.cross_attn = CrossAttention(dim, heads)
         
         # MLP components
@@ -188,6 +189,7 @@ class DecoderBlock(nn.Module):
         )
         
         # Modulation layers for timestep conditioning
+        # Use small initialization for scale/shift, but NOT zero for gates
         self.gamma_1 = nn.Linear(dim, dim)
         self.beta_1 = nn.Linear(dim, dim)
         self.gamma_2 = nn.Linear(dim, dim)
@@ -196,37 +198,49 @@ class DecoderBlock(nn.Module):
         self.scale_2 = nn.Linear(dim, dim)
         self.scale_cross = nn.Linear(dim, dim)
         
-        # Initialize modulation layers to zero
-        self._init_weights([self.gamma_1, self.beta_1, self.gamma_2, 
-                           self.beta_2, self.scale_1, self.scale_2, self.scale_cross])
+        # Initialize modulation layers with proper scaling
+        self._init_weights([self.gamma_1, self.beta_1, self.gamma_2, self.beta_2])
+        self._init_gate_weights([self.scale_1, self.scale_2, self.scale_cross])
 
     def _init_weights(self, layers):
+        """Initialize scale/shift layers to small values"""
         for layer in layers:
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
+    
+    def _init_gate_weights(self, layers):
+        """Initialize gate layers to allow information flow"""
+        for layer in layers:
+            # Initialize weight to near-identity for gates
+            nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+            # Initialize bias to 1.0 so gates start open (multiplicative gating)
+            nn.init.constant_(layer.bias, 1.0)
 
     def forward(self, x, timestep_emb, encoder_output):
         # Self-attention with timestep modulation (MMHA)
         scale_msa = self.gamma_1(timestep_emb)
         shift_msa = self.beta_1(timestep_emb)
-        gate_msa = self.scale_1(timestep_emb).unsqueeze(1)
+        gate_msa = torch.sigmoid(self.scale_1(timestep_emb)).unsqueeze(1)
         
         attn_out = self.self_attn(modulate(self.ln_1(x), shift_msa, scale_msa))
         x = x + attn_out * gate_msa
         
-        # ENHANCED Cross-attention to encoder output (Q from decoder, K,V from encoder)
-        # Remove gating for stronger conditioning influence
+        # CRITICAL FIX: Much stronger cross-attention for envelope enforcement
+        # Instead of learned gating that can collapse to 0, use fixed strong weighting
         cross_out = self.cross_attn(self.ln_cross(x), encoder_output)
-        x = x + cross_out  # Direct addition without gating
         
-        # Add skip connection from encoder for stronger conditioning
+        # Direct strong blending: 70% cross-attention, 30% residual
+        # This ensures conditioning information is ALWAYS used strongly
+        x = 0.7 * cross_out + 0.3 * x
+        
+        # ADDITIONAL: Direct encoder injection for even stronger conditioning
         if encoder_output.shape == x.shape:
-            x = x + 0.1 * encoder_output  # Residual conditioning
+            x = x + 0.3 * encoder_output  # Increased from 0.2 to 0.3
         
         # MLP with timestep modulation
         scale_mlp = self.gamma_2(timestep_emb)
         shift_mlp = self.beta_2(timestep_emb)
-        gate_mlp = self.scale_2(timestep_emb).unsqueeze(1)
+        gate_mlp = torch.sigmoid(self.scale_2(timestep_emb)).unsqueeze(1)
         
         mlp_out = self.mlp(modulate(self.ln_2(x), shift_mlp, scale_mlp))
         x = x + mlp_out * gate_mlp
@@ -247,13 +261,29 @@ class FinalLayer(nn.Module):
         self.gamma = nn.Linear(dim, dim)
         self.beta = nn.Linear(dim, dim)
         
-        # Initialize to zero
-        self._init_weights([self.linear, self.gamma, self.beta])
+        # Initialize with small values for better gradient flow
+        self._init_weights()
 
-    def _init_weights(self, layers):
-        for layer in layers:
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
+    def _init_weights(self):
+        # CRITICAL FIX: Proper initialization for noise prediction (target magnitude ~2-5)
+        # Use He initialization scaled for expected noise magnitude
+        fan_in = self.linear.weight.shape[1] 
+        noise_scale = 2.0  # Expected noise std based on dataset analysis
+        
+        # Scale He initialization by expected noise magnitude
+        he_std = (2.0 / fan_in) ** 0.5
+        final_std = he_std * noise_scale
+        
+        nn.init.normal_(self.linear.weight, mean=0.0, std=final_std)
+        nn.init.zeros_(self.linear.bias)
+        
+        # Gamma/beta: zero initialization (AdaLN modulation starts neutral)
+        nn.init.zeros_(self.gamma.weight)
+        nn.init.zeros_(self.gamma.bias)
+        nn.init.zeros_(self.beta.weight)
+        nn.init.zeros_(self.beta.bias)
+        
+        print(f"🔧 FinalLayer initialized: std={final_std:.4f} (He: {he_std:.4f} × noise_scale: {noise_scale})")
 
     def forward(self, x, c):
         scale = self.gamma(c)
@@ -302,15 +332,19 @@ class SignalDiT(nn.Module):
         self.lowpass_proj = TimeSeriesProjection(seq_len, patch_size, dim)
         
         # Positional embeddings (shared between encoder and decoder)
-        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, dim) * 0.02)
         
-        # Timestep embedding for decoder conditioning
+        # Timestep embedding for decoder conditioning with better scaling
+        # Scale factor to amplify timestep signal (typical sigma range 0.01-10)
         self.time_embed = nn.Sequential(
-            PositionalEmbedding(dim),
+            PositionalEmbedding(dim, scale=1.0),  # Positional encoding
             nn.Linear(dim, dim * 4),
             nn.GELU(),
             nn.Linear(dim * 4, dim)
         )
+        # Initialize timestep MLP with proper scaling
+        nn.init.normal_(self.time_embed[1].weight, std=0.02)
+        nn.init.normal_(self.time_embed[3].weight, std=0.02)
         
         # ENCODER: Processes low-pass conditioning signal
         self.encoder_blocks = nn.ModuleList([

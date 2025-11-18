@@ -42,11 +42,22 @@ def plot_batch(tensor, plot_shape, filename, img_size=32):
     plt.close()
 
 class Config(object):
-    def __init__(self, input_dict, save_dir):
+    def __init__(self, input_dict, save_dir, allow_dynamic_update=True):
         file_path = os.path.join(save_dir, "config.json")
         # Check if the configuration file exists
         if os.path.exists(file_path):
             self.load_config(file_path)
+            
+            # Override with dynamic values if requested
+            if allow_dynamic_update:
+                dynamic_keys = ['seq_len', 'sample_rate']  # Keys that can be dynamically updated
+                for key in dynamic_keys:
+                    if key in input_dict:
+                        old_value = getattr(self, key, None)
+                        new_value = input_dict[key]
+                        if old_value != new_value:
+                            print(f"🔄 Dynamic update: {key} {old_value} → {new_value}")
+                            setattr(self, key, new_value)
         else:
             for key, value in input_dict.items():
                 setattr(self, key, value)

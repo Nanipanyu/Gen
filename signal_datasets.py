@@ -133,40 +133,70 @@ class EarthquakeSignalDataset(Dataset):
             # Load preprocessed signal data from bandfilter_acc.py
             data = np.load(signal_path)
             
-            # Extract broadband signal (already band-pass filtered 0.1-30 Hz)
-            y_broad = data['signal_broadband'].copy()
-            
-            # Extract raw windowed signal for low-pass filtering
-            if 'signal_raw_windowed' in data:
-                raw_windowed = data['signal_raw_windowed'].copy()
+            # Extract signals - CHECK FOR PROPER PAIRS FIRST
+            if 'signal_lowfreq' in data:
+                # NEW: Use pre-computed proper pairs (from fixed_preprocessing.py)
+                y_broad = data['signal_broadband'].copy()
+                x_low = data['signal_lowfreq'].copy()
+                print(f"✅ Using pre-paired signals from {os.path.basename(signal_path)}")
             else:
-                # Fallback: use broadband if raw not available
-                raw_windowed = y_broad.copy()
+                # OLD: Create low-freq on-the-fly (PROBLEMATIC!)
+                print(f"⚠️ Creating low-freq on-the-fly for {os.path.basename(signal_path)} - THIS IS PROBLEMATIC!")
+                y_broad = data['signal_broadband'].copy()
+                
+                if 'signal_raw_windowed' in data:
+                    raw_windowed = data['signal_raw_windowed'].copy()
+                else:
+                    raw_windowed = y_broad.copy()
+                
+                # Ensure signals are the right length
+                y_broad = self._process_signal_length(y_broad)
+                raw_windowed = self._process_signal_length(raw_windowed)
+                
+                # Apply low-pass filtering (<1 Hz) for conditioning signal
+                x_low = self._apply_lowpass_filter(raw_windowed, self.lowpass_cutoff)
             
-            # Ensure signals are the right length
-            y_broad = self._process_signal_length(y_broad)
-            raw_windowed = self._process_signal_length(raw_windowed)
-            
-            # Apply low-pass filtering (<1 Hz) for conditioning signal
-            # This is done HERE in signal_datasets.py, not in bandfilter_acc.py
-            x_low = self._apply_lowpass_filter(raw_windowed, self.lowpass_cutoff)
-            
-            # Calculate PGA values (done HERE in signal_datasets.py)
-            pga_broad = np.max(np.abs(y_broad))
-            pga_low = np.max(np.abs(x_low))
+            # Handle PGA and normalization correctly for pre-processed data
+            if 'normalization_pga' in data:
+                # NEW: Data is already normalized! Just get original PGA values
+                pga_broad = float(data['pga_broadband'])
+                pga_low = float(data['pga_lowfreq'])
+                norm_pga = float(data['normalization_pga'])
+                print(f"   ✅ Data already normalized by PGA: {norm_pga:.6f}")
+                print(f"   Signal ranges after loading: y_broad=[{y_broad.min():.3f}, {y_broad.max():.3f}], x_low=[{x_low.min():.3f}, {x_low.max():.3f}]")
+                
+                # Signals should already be in [-1, 1] range
+                if self.normalize:
+                    # Already normalized, but store normalized PGA values
+                    pga_broad_norm = pga_broad / norm_pga
+                    pga_low_norm = pga_low / norm_pga
+                else:
+                    # If user wants unnormalized, multiply back
+                    y_broad = y_broad * norm_pga
+                    x_low = x_low * norm_pga
+                    pga_broad_norm = pga_broad
+                    pga_low_norm = pga_low
+            else:
+                # OLD: Data not pre-normalized, calculate PGA and normalize here
+                pga_broad = np.max(np.abs(y_broad))
+                pga_low = np.max(np.abs(x_low))
+                
+                if self.normalize:
+                    norm_pga = pga_broad  # Use broadband PGA
+                    if norm_pga > self.pga_threshold:
+                        y_broad = y_broad / norm_pga
+                        x_low = x_low / norm_pga
+                        pga_broad_norm = 1.0  # Normalized to 1
+                        pga_low_norm = pga_low / norm_pga
+                else:
+                    pga_broad_norm = pga_broad
+                    pga_low_norm = pga_low
             
             # Validate signal quality
             if self.validate_signals:
-                if not self._is_valid_signal(y_broad, pga_broad):
+                if not self._is_valid_signal(y_broad, max(abs(y_broad.min()), abs(y_broad.max()))):
                     warnings.warn(f"Invalid signal in {signal_path}, using fallback")
                     return self._get_fallback_sample()
-            
-            # Normalize by PGA if requested
-            if self.normalize:
-                if pga_broad > self.pga_threshold:
-                    y_broad = y_broad / pga_broad
-                if pga_low > self.pga_threshold:
-                    x_low = x_low / pga_low
             
             # Apply transforms if provided
             if self.transform:
@@ -182,21 +212,21 @@ class EarthquakeSignalDataset(Dataset):
                 'trigger_idx': int(data.get('trigger_idx', -1)),
                 'component': str(data.get('component', 'unknown')),
                 'augmentation_type': str(data.get('augmentation_type', 'original')),
-                'augmentation_applied': list(data.get('augmentation_applied', [])),
+                'augmentation_applied': [],  # FIX: Skip corrupted augmentation_applied field
                 'rotation_angle': float(data.get('rotation_angle', 0.0))
             }
             
             # Convert to tensors
             y_broad = torch.tensor(y_broad, dtype=torch.float32)
             x_low = torch.tensor(x_low, dtype=torch.float32)
-            pga_broad = torch.tensor(pga_broad, dtype=torch.float32)
-            pga_low = torch.tensor(pga_low, dtype=torch.float32)
+            pga_broad_tensor = torch.tensor(pga_broad_norm, dtype=torch.float32)
+            pga_low_tensor = torch.tensor(pga_low_norm, dtype=torch.float32)
             
             return {
                 'broadband': y_broad,      # 0.1-30 Hz (generation target)
                 'lowfreq': x_low,          # <1 Hz (conditioning signal)
-                'pga_broadband': pga_broad,
-                'pga_lowfreq': pga_low,
+                'pga_broadband': pga_broad_tensor,
+                'pga_lowfreq': pga_low_tensor,
                 'metadata': metadata
             }
             
