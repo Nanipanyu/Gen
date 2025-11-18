@@ -10,3 +10,7 @@ mtp/
 # Data directory (exclude all except bandfilter_acc.py)
 data_prep_acc/*
 !data_prep_acc/bandfilter_acc.py
+
+# PGA predictor
+pga_predictor.py
+

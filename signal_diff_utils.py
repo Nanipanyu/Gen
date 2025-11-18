@@ -152,12 +152,7 @@ class SignalDiffusion(object):
         if seed is not None:
             with torch.random.fork_rng():
                 torch.manual_seed(seed)
-                return self.                # Generate sigmas using same log-normal distribution as training
-                rho = 7.0
-                min_inv_rho = (0.002 ** (1 / rho))
-                max_inv_rho = (sigma_max ** (1 / rho))
-                ramp = torch.linspace(0, 1, steps + 1, device=device)
-                t_steps = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho(model, sz, steps, sigma_max, x_cond)
+                return self._sample_internal(model, sz, steps, sigma_max, x_cond)
         else:
             return self._sample_internal(model, sz, steps, sigma_max, x_cond)
 
