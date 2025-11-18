@@ -14,10 +14,12 @@ Traditional physics-based earthquake simulations are limited to low frequencies 
 
 ## Quick Start
 
-### 1. Process AT2 Files
+### 1. Prepare Data
+Place your earthquake data (AT2 files) in the `data_prep_acc/rawdata/` directory, then run:
 ```bash
-python train_signal.py --process_at2 --at2_input_dir raw_data/ --data_dir processed_data/
+python dynamic_preprocessing.py
 ```
+This will process the raw data and generate normalized signals in `data_prep_acc/processed_dynamic/`.
 
 ### 2. Train Signal DiT
 ```bash
