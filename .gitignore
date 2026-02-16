@@ -2,7 +2,10 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Model directory
-signal_model_v1/
+signal_model_v3/
+signal_model_v4/
+signal_model_v5/
+
 
 # Virtual environment
 mtp/

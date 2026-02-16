@@ -96,7 +96,7 @@ def find_target_length(at2_files):
     return capped_length, max_rate, reference_file
 
 def main():
-    """Process AT2 files with preserved sampling rates and zero-padding"""
+    """Process AT2 files with preserved sampling rates and variable lengths"""
     
     input_dir = "data_prep_acc/rawdata"
     output_dir = "data_prep_acc/processed_dynamic"
@@ -117,7 +117,6 @@ def main():
     target_length, reference_rate, reference_file = find_target_length(at2_files)
     
     processed_count = 0
-    padding_stats = []
     
     for file_path in at2_files:
         try:
@@ -129,63 +128,42 @@ def main():
             print(f"   Original: {len(acceleration)} samples, {original_rate:.1f} Hz, {original_duration:.1f}s")
             
             # NO RESAMPLING - preserve original sampling rate and quality
+            # NO PADDING - V2 architecture handles variable lengths via packed attention
             processed_signal = acceleration.copy()
             
-            # Zero-pad to target length (preserve NPTS, just extend with zeros)
-            if len(processed_signal) < target_length:
-                padding_needed = target_length - len(processed_signal)
-                padding_percent = (padding_needed / target_length) * 100
-                padding_stats.append(padding_percent)
-                
-                # Pad with zeros at the end (preserve signal start timing)
-                processed_signal = np.pad(processed_signal, (0, padding_needed), mode='constant', constant_values=0)
-                print(f"   Zero-padded: +{padding_needed} samples ({padding_percent:.1f}% padding)")
-            elif len(processed_signal) > target_length:
-                # This shouldn't happen since we use the longest as target, but just in case
-                processed_signal = processed_signal[:target_length]
-                print(f"   Truncated to: {target_length} samples")
-            
-            print(f"   Final: {len(processed_signal)} samples at {original_rate:.1f} Hz")
+            print(f"   Processing: {len(processed_signal)} samples at {original_rate:.1f} Hz (variable length)")
             
             # Apply filters with original sampling rate
             broadband, lowfreq = apply_filters(processed_signal, original_rate)
             
-            # Calculate PGA values for normalization
+            # Calculate PGA values for reference (signals kept RAW, not normalized)
             pga_broadband = np.max(np.abs(broadband))
             pga_lowfreq = np.max(np.abs(lowfreq))
             
-            # CRITICAL FIX: Normalize each signal by its OWN PGA to ensure both are in [-1, 1]
-            if pga_broadband > 1e-6:  # Valid signal
-                broadband_normalized = broadband / pga_broadband
-            else:
-                print(f"   ⚠️ Warning: Very small broadband PGA ({pga_broadband:.2e}), using original signal")
-                broadband_normalized = broadband
+            # FIX BUG #1: Keep signals RAW (no normalization)
+            # Training will work with original signal scales
+            # This ensures diffusion happens at the correct physical amplitude
+            broadband_raw = broadband  # Keep original scale
+            lowfreq_raw = lowfreq      # Keep original scale
             
-            if pga_lowfreq > 1e-6:  # Valid signal
-                lowfreq_normalized = lowfreq / pga_lowfreq
-            else:
-                print(f"   ⚠️ Warning: Very small lowfreq PGA ({pga_lowfreq:.2e}), using original signal")
-                lowfreq_normalized = lowfreq
-            
-            # Save processed data
+            # Save processed data (RAW signals, not normalized)
             output_name = os.path.basename(file_path).replace('.AT2', '_processed.npz')
             output_path = os.path.join(output_dir, output_name)
             
             np.savez_compressed(output_path,
-                signal_broadband=broadband_normalized,
-                signal_lowfreq=lowfreq_normalized,
-                pga_broadband=pga_broadband,
-                pga_lowfreq=pga_lowfreq,
-                sampling_rate=original_rate,  # PRESERVE ORIGINAL RATE
+                signal_broadband=broadband_raw,        # RAW broadband signal
+                signal_lowfreq=lowfreq_raw,            # RAW lowpass signal
+                pga_broadband=pga_broadband,           # Saved for reference only
+                pga_lowfreq=pga_lowfreq,               # Saved for reference only
+                sampling_rate=original_rate,           # PRESERVE ORIGINAL RATE
                 duration=len(processed_signal) / original_rate,
-                original_samples=len(acceleration),
-                padded_samples=len(processed_signal),
+                actual_samples=len(processed_signal),
                 file_path=file_path  # Store for reference
             )
             
             print(f"   ✅ Saved: {output_name}")
             print(f"   📊 PGA broadband: {pga_broadband:.4f}")
-            print(f"   📊 Normalized ranges: broad=[{broadband_normalized.min():.3f}, {broadband_normalized.max():.3f}], low=[{lowfreq_normalized.min():.3f}, {lowfreq_normalized.max():.3f}]")
+            print(f"   📊 RAW ranges (not normalized): broad=[{broadband_raw.min():.6f}, {broadband_raw.max():.6f}], low=[{lowfreq_raw.min():.6f}, {lowfreq_raw.max():.6f}]")
             
             processed_count += 1
             
@@ -193,31 +171,25 @@ def main():
             print(f"   ❌ Error processing {file_path}: {e}")
             continue
     
-    # Statistics
-    avg_padding = np.mean(padding_stats) if padding_stats else 0
-    max_padding = max(padding_stats) if padding_stats else 0
-    
     print(f"\n🎉 PROCESSING COMPLETE!")
     print(f"✅ Successfully processed: {processed_count}/{len(at2_files)} files")
     print(f"💾 Output directory: {output_dir}")
-    print(f"📏 DYNAMIC PARAMETERS DETECTED:")
-    print(f"   - Sequence length: {target_length} samples")
+    print(f"📏 LENGTH RANGE DETECTED:")
+    print(f"   - Maximum length: {target_length} samples")
     print(f"   - Reference sampling rate: {reference_rate:.1f} Hz")
-    print(f"   - Target duration: {target_length / reference_rate:.1f} seconds")
-    print(f"\n📊 PADDING STATISTICS:")
-    print(f"   - Average padding: {avg_padding:.1f}%")
-    print(f"   - Maximum padding: {max_padding:.1f}%")
-    print(f"   - Files needing padding: {len(padding_stats)}/{processed_count}")
+    print(f"   - Maximum duration: {target_length / reference_rate:.1f} seconds")
     
     print(f"\n✅ PRESERVED DATA QUALITY:")
     print(f"   - Original sampling rates maintained")
     print(f"   - No resampling artifacts")
-    print(f"   - Zero-padding preserves signal timing")
-    print(f"   - Consistent PGA normalization for signal pairing")
+    print(f"   - Variable-length sequences (no padding)")
+    print(f"   - Packed attention handles length variations")
+    print(f"   - RAW signal amplitudes preserved (NO normalization)")
+    print(f"   - PGA values saved for reference only")
     
     print(f"\n🚀 Next steps:")
-    print(f"1. Your signal_config.py will auto-detect: seq_len={target_length}, sample_rate={reference_rate:.1f}")
-    print(f"2. Run: python train_signal.py --data_dir data_prep_acc/processed_dynamic")
+    print(f"1. Dataset will pack variable-length sequences efficiently")
+    print(f"2. Run: python train_signal_v2.py --data_dir data_prep_acc/processed_dynamic --batch_size 2 --pack_size 2")
 
 if __name__ == "__main__":
     main()
