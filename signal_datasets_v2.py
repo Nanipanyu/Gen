@@ -175,42 +175,36 @@ class EarthquakeSignalDatasetV2(Dataset):
                 broadband_normalized = broadband_normalized[:self.max_length]
                 signal_len = self.max_length
             
-            # Get PGA value to denormalize
+            # FIX BUG #1: Signals are saved RAW (not normalized), so NO denormalization needed!
+            # The preprocessing now saves signals in original physical scale.
+            # PGA is saved only for reference, not for denormalization.
             if 'pga_broadband' in data:
-                pga = float(data['pga_broadband'])
+                pga = float(data['pga_broadband'])  # Saved for metadata only
             else:
                 pga = np.max(np.abs(broadband_normalized))
-                print(f"Warning: No PGA found in {signal_path}, using computed value {pga:.6f}")
             
-            # DENORMALIZE: Convert from normalized [-1, 1] back to original scale
-            broadband = broadband_normalized * pga
+            # Use signal directly - it's already in correct RAW scale
+            broadband = broadband_normalized
             
             # Compute envelope from broadband signal
             envelope = self._compute_envelope(broadband)
             
             # Extract or create lowpass signal
             if 'signal_lowfreq' in data:
-                lowpass_normalized = data['signal_lowfreq'].copy()
-                if len(lowpass_normalized) > self.max_length:
-                    lowpass_normalized = lowpass_normalized[:self.max_length]
-                # Get lowpass PGA if available
+                # FIX BUG #3: Lowpass is also saved RAW, use directly
+                lowpass = data['signal_lowfreq'].copy()
+                if len(lowpass) > self.max_length:
+                    lowpass = lowpass[:self.max_length]
+                # PGA saved for reference only
                 if 'pga_lowfreq' in data:
                     pga_lowfreq = float(data['pga_lowfreq'])
-                    lowpass = lowpass_normalized * pga_lowfreq
-                else:
-                    lowpass = lowpass_normalized * pga  # Use broadband PGA as fallback
             elif 'lowfreq_normalized' in data:
-                lowpass_normalized = data['lowfreq_normalized'].copy()
-                if len(lowpass_normalized) > self.max_length:
-                    lowpass_normalized = lowpass_normalized[:self.max_length]
-                # Denormalize lowpass
-                if 'pga_lowfreq' in data:
-                    pga_lowfreq = float(data['pga_lowfreq'])
-                    lowpass = lowpass_normalized * pga_lowfreq
-                else:
-                    lowpass = lowpass_normalized * pga
+                # Legacy support: old format (actually already in correct scale)
+                lowpass = data['lowfreq_normalized'].copy()
+                if len(lowpass) > self.max_length:
+                    lowpass = lowpass[:self.max_length]
             else:
-                # Apply lowpass filter to denormalized signal
+                # Generate lowpass by filtering the RAW broadband signal
                 lowpass = self._apply_lowpass_filter(broadband)
             
             # Extract metadata

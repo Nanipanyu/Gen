@@ -83,24 +83,23 @@ def compute_dataset_statistics(signal_paths, max_samples=100):
     for i, path in enumerate(signal_paths[:max_samples]):
         try:
             data = np.load(path)
-            # Get signal
+            # Get signal - FIX BUG #2: Signals are RAW, don't multiply by PGA!
             if 'signal_broadband' in data:
-                signal = data['signal_broadband']
-                pga = data.get('pga_broadband', np.max(np.abs(signal)))
-                signal_denorm = signal * pga
+                signal = data['signal_broadband']  # Already RAW scale
+                pga = data.get('pga_broadband', np.max(np.abs(signal)))  # For reference only
             elif 'signal_normalized' in data:
-                signal_denorm = data['signal_normalized']
+                signal = data['signal_normalized']  # Legacy format
             else:
                 continue
             
-            # Compute envelope
+            # Compute envelope from RAW signal
             try:
-                analytic = hilbert(signal_denorm)
+                analytic = hilbert(signal)
                 envelope = np.abs(analytic)
             except:
-                envelope = np.abs(signal_denorm)
+                envelope = np.abs(signal)
             
-            signal_values.append(signal_denorm)
+            signal_values.append(signal)
             envelope_values.append(envelope)
             
         except Exception as e:
@@ -477,6 +476,13 @@ def train_epoch(
         sqrt_alpha_t = sqrt_alphas_cumprod[t].view(-1, 1)
         sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
         
+        # DEBUG: Verify scales match (critical for correct training)
+        if batch_idx == 0 and epoch % 10 == 0:
+            print(f"\n🔍 SCALE VERIFICATION (Epoch {epoch}):")
+            print(f"   Broadband - Range: [{broadband.min():.6f}, {broadband.max():.6f}], Std: {broadband.std():.6f}")
+            print(f"   Noise     - Range: [{noise.min():.6f}, {noise.max():.6f}], Std: {noise.std():.6f}")
+            print(f"   Noise/Signal std ratio: {noise.std() / (broadband.std() + 1e-8):.3f}x (should be ~1.0x)")
+        
         noisy_broadband = sqrt_alpha_t * broadband + sqrt_one_minus_alpha_t * noise
         
         # Predict noise
@@ -490,6 +496,18 @@ def train_epoch(
             actual_length=actual_length,
             position_ids=position_ids
         )
+        
+        # CRITICAL DEBUG: Check if model is learning or stuck
+        if batch_idx == 0 and epoch % 5 == 0:
+            print(f"\n🔬 TRAINING DIAGNOSTICS (Epoch {epoch}, Batch {batch_idx}):")
+            print(f"   Input noisy signal: range [{noisy_broadband.min():.6f}, {noisy_broadband.max():.6f}], std {noisy_broadband.std():.6f}")
+            print(f"   Lowpass conditioning: range [{lowpass.min():.6f}, {lowpass.max():.6f}], std {lowpass.std():.6f}")
+            print(f"   Envelope conditioning: range [{envelope.min():.6f}, {envelope.max():.6f}], std {envelope.std():.6f}")
+            print(f"   Target noise: range [{noise.min():.6f}, {noise.max():.6f}], std {noise.std():.6f}")
+            print(f"   Predicted noise: range [{predicted_noise.min():.6f}, {predicted_noise.max():.6f}], std {predicted_noise.std():.6f}")
+            print(f"   Prediction diversity: unique values = {torch.unique(predicted_noise).shape[0]} (should be >1000)")
+            if predicted_noise.std() < 1e-6:
+                print(f"   ⚠️ WARNING: Model predicting CONSTANT values! Check if model is frozen or gradients are zero.")
         
         # Compute waveform loss with SNR weighting
         waveform_loss = compute_loss_with_weighting(
@@ -544,6 +562,26 @@ def train_epoch(
         if grad_stats['exploded']:
             grad_stats_accum['exploded_count'] += 1
         
+        # CRITICAL DEBUG: Check if gradients are flowing
+        if batch_idx == 0 and epoch % 5 == 0:
+            if grad_stats['total_norm'] < 1e-6:
+                print(f"   ⚠️ WARNING: Gradients are ZERO! Model not learning. Check:")
+                print(f"      - Are model parameters frozen? (requires_grad=True?)")
+                print(f"      - Is loss computation correct?")
+                print(f"      - Are inputs connected to outputs?")
+            else:
+                print(f"   ✓ Gradient norm: {grad_stats['total_norm']:.6f} (healthy if > 1e-3)")
+        
+        # CRITICAL DEBUG: Check if gradients are flowing
+        if batch_idx == 0 and epoch % 5 == 0:
+            if grad_stats['total_norm'] < 1e-6:
+                print(f"   ⚠️ WARNING: Gradients are ZERO! Model not learning. Check:")
+                print(f"      - Are model parameters frozen? (requires_grad=True?)")
+                print(f"      - Is loss computation correct?")
+                print(f"      - Are inputs connected to outputs?")
+            else:
+                print(f"   ✓ Gradient norm: {grad_stats['total_norm']:.6f} (healthy if > 1e-3)")
+        
         # IMPROVED: Adaptive gradient clipping to prevent explosion
         # More aggressive clipping during early training and when gradients are large
         if grad_stats['total_norm'] > grad_clip * 3:
@@ -585,6 +623,9 @@ def train_epoch(
                     corr = (pred_centered * target_centered).sum() / (
                         torch.sqrt((pred_centered ** 2).sum() * (target_centered ** 2).sum()) + 1e-8
                     )
+                    # Handle NaN correlation
+                    if torch.isnan(corr):
+                        corr = torch.tensor(0.0, device=device)
                     writer.add_scalar('Envelope/correlation', corr.item(), global_step)
                     
                     print(f"Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.6f}, "
@@ -727,11 +768,16 @@ def evaluate(
         # Predict x0 from noise (standard DDPM formula)
         pred_x0 = (x - sqrt_one_minus_alpha_t * predicted_noise) / sqrt_alpha_t
         
-        # FIX BUG #1: Remove hard clamp - let model learn the correct scale
-        # Only apply very loose clipping to prevent numerical instability
-        # Signals have std ≈ 0.002, so ±0.05 is ~25σ (extremely conservative)
+        # FIXED: Remove aggressive clamp that was causing flat outputs
+        # Original clamp at ±0.05 was cutting off valid earthquake peaks
+        # For early debugging/training, let model learn natural amplitude range
+        # Only apply extreme outlier protection to prevent NaN propagation
         if not normalize:
-            pred_x0 = torch.clamp(pred_x0, -0.05, 0.05)  # Loose clamp at physical scale
+            # Very loose clamp: ±0.2 is ~100σ (only catches numerical explosions)
+            pred_x0 = torch.clamp(pred_x0, -0.2, 0.2)
+        else:
+            # For normalized training (if re-enabled): ±5σ is reasonable
+            pred_x0 = torch.clamp(pred_x0, -5.0, 5.0)
         
         # DDIM update (deterministic when eta=0)
         # Standard formula: x_{t-1} = sqrt(alpha_{t-1}) * pred_x0 + sqrt(1 - alpha_{t-1}) * pred_noise
